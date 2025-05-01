@@ -1,5 +1,8 @@
 # File: main_app.py
+# -*- coding: utf-8 -*-
+
 import tkinter as tk
+from tkinter import ttk  # For Combobox
 from tkinter import (
     scrolledtext,
     messagebox,
@@ -19,12 +22,25 @@ from tkinter import (
     Radiobutton,
     Frame,
     LabelFrame,
-)  # Added LabelFrame
-import database as db
-from thefuzz import process
+    EXTENDED,
+)  # Added EXTENDED
+import database as db  # Assumes database.py is in the same directory
+from thefuzz import process  # For fuzzy matching
 import os  # For environment variables and path handling
 import sys  # To detect if running as frozen executable
-import google.generativeai as genai
+
+# Attempt to import Gemini library, handle if not installed
+try:
+    import google.generativeai as genai
+
+    GEMINI_AVAILABLE = True
+except ImportError:
+    print(
+        "WARNING: google-generativeai library not found. Gemini AI functionality will be disabled."
+    )
+    print("Install it using: pip install google-generativeai")
+    GEMINI_AVAILABLE = False
+    genai = None  # Define genai as None if import fails
 
 # --- Constants ---
 NO_MATCH_TEXT = "--- NO MATCH FOUND ---"
@@ -33,12 +49,27 @@ ENGINE_FUZZY = "fuzzy"
 ENGINE_GEMINI = "gemini"
 GEMINI_API_ENV_VAR = "GEMINI_API_KEY"
 API_KEY_FILENAME = "api_key.txt"  # Name of the key file
-GEMINI_MODEL_NAME = "gemini-1.5-flash"
 
+# Define available models for the dropdown
+AVAILABLE_GEMINI_MODELS = [
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-2.0-flash",
+    # Add newer/experimental ones carefully if desired, e.g.:
+    # 'gemini-2.5-pro' # Check availability/stability first
+]
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"  # User's last choice
+
+DEFAULT_GEMINI_INSTRUCTIONS = """Your Task: Respond with ONLY the single best matching SKU name exactly as it appears in the 'Available SKUs' list.
+If none of the SKUs in the list are a suitable match for the product name, respond with the exact text: NO MATCH
+Do not include any explanations, introductions, or formatting other than the single matching SKU or "NO MATCH"."""
 
 # --- Matching Logic ---
-# find_best_sku_match_fuzzy remains the same
+
+
+# Fuzzy Match Function
 def find_best_sku_match_fuzzy(product_name, sku_list, threshold):
+    """Finds the best matching SKU using fuzzy matching."""
     if not product_name or not sku_list:
         return NO_MATCH_TEXT
     try:
@@ -56,16 +87,30 @@ def find_best_sku_match_fuzzy(product_name, sku_list, threshold):
         return "--- ERROR DURING FUZZY MATCH ---"
 
 
-# find_best_sku_match_gemini remains the same
-def find_best_sku_match_gemini(product_name, sku_list, api_key):
+# Gemini Match Function
+def find_best_sku_match_gemini(
+    product_name, sku_list, api_key, model_name, instructions
+):
+    """Matches product name to SKU list using Gemini AI."""
+    if not GEMINI_AVAILABLE:
+        return "--- GEMINI LIBRARY NOT INSTALLED ---"  # Check if library loaded
     if not product_name or not sku_list:
         return NO_MATCH_TEXT
     if not api_key:
         print("Error: Gemini API key not provided.")
         return "--- ERROR: MISSING API KEY ---"
+    if not model_name:
+        print("Error: Gemini model name not provided.")
+        return "--- ERROR: MISSING MODEL NAME ---"
+    if not instructions:
+        print("Error: Gemini prompt instructions not provided.")
+        return "--- ERROR: MISSING INSTRUCTIONS ---"
+
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+        model = genai.GenerativeModel(model_name)
+
+        # Construct the prompt carefully using the provided instructions
         prompt = f"""Analyze the following product name and list of SKUs. Identify the single best matching SKU from the list provided.
 
 Product Name: "{product_name}"
@@ -73,11 +118,12 @@ Product Name: "{product_name}"
 Available SKUs:
 {chr(10).join(f"- {sku}" for sku in sku_list)}
 
-Your Task: Respond with ONLY the single best matching SKU name exactly as it appears in the 'Available SKUs' list.
-If none of the SKUs in the list are a suitable match for the product name, respond with the exact text: NO MATCH
-Do not include any explanations, introductions, or formatting other than the single matching SKU or "NO MATCH".
+{instructions}
 """
+
         response = model.generate_content(prompt)
+
+        # Validate and parse the response
         try:
             gemini_result = response.text.strip()
             if gemini_result == "NO MATCH":
@@ -86,7 +132,7 @@ Do not include any explanations, introductions, or formatting other than the sin
                 return gemini_result
             else:
                 print(
-                    f"Warning: Gemini returned text ('{gemini_result}') not exactly in SKU list for product '{product_name}'. Treating as no match."
+                    f"Warning: Gemini returned text ('{gemini_result}') not exactly in SKU list or 'NO MATCH' for product '{product_name}'. Treating as no match."
                 )
                 return NO_MATCH_TEXT
         except ValueError:
@@ -97,21 +143,27 @@ Do not include any explanations, introductions, or formatting other than the sin
         except Exception as e_parse:
             print(f"Error parsing Gemini response for '{product_name}': {e_parse}")
             return "--- ERROR PARSING GEMINI RESPONSE ---"
+
     except Exception as e_api:
-        print(f"Error during Gemini API call for '{product_name}': {e_api}")
+        print(
+            f"Error during Gemini API call for '{product_name}' (Model: {model_name}): {e_api}"
+        )
         if "API key not valid" in str(e_api):
             return "--- ERROR: INVALID API KEY ---"
+        if (
+            "not found" in str(e_api).lower()
+            or "permission denied" in str(e_api).lower()
+        ):
+            return f"--- ERROR: MODEL '{model_name}' NOT FOUND/ACCESSIBLE ---"
         return "--- ERROR DURING GEMINI API CALL ---"
 
 
 # --- GUI Classes ---
 
 
-# SkuManagerWindow class remains IDENTICAL
 class SkuManagerWindow(Toplevel):
     """Window for managing the SKUs in the database."""
 
-    # ... (Keep the exact code from the previous response) ...
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Manage SKUs")
@@ -125,12 +177,14 @@ class SkuManagerWindow(Toplevel):
         self.add_button = Button(self.add_frame, text="Add SKU", command=self.add_sku)
 
         self.list_frame = Frame(self)
-        self.list_label = Label(self.list_frame, text="Current SKUs:")
+        self.list_label = Label(
+            self.list_frame, text="Current SKUs (Ctrl/Shift+Click for multi-select):"
+        )
         self.scrollbar = Scrollbar(self.list_frame, orient=tk.VERTICAL)
         self.sku_listbox = Listbox(
             self.list_frame,
             yscrollcommand=self.scrollbar.set,
-            selectmode=SINGLE,
+            selectmode=EXTENDED,  # Allow multi-selection
             width=50,
             height=12,
         )
@@ -145,7 +199,7 @@ class SkuManagerWindow(Toplevel):
         self.delete_button = Button(
             self.action_button_frame,
             text="Delete Selected",
-            command=self.delete_selected_sku,
+            command=self.delete_selected_skus,
         )
         self.paste_button = Button(
             self.action_button_frame,
@@ -179,26 +233,14 @@ class SkuManagerWindow(Toplevel):
         self.sku_entry.focus_set()
 
     def refresh_sku_list(self):
-        current_selection_index = self.sku_listbox.curselection()
-        current_value = None
-        if current_selection_index:
-            current_value = self.sku_listbox.get(current_selection_index[0])
+        """Clears and reloads the listbox with SKUs from the database."""
         self.sku_listbox.delete(0, END)
         skus = db.get_all_skus()
-        new_selection_index = None
-        for i, sku in enumerate(skus):
+        for sku in skus:
             self.sku_listbox.insert(END, sku)
-            if sku == current_value:
-                new_selection_index = i
-        if new_selection_index is not None:
-            try:
-                self.sku_listbox.select_set(new_selection_index)
-                self.sku_listbox.activate(new_selection_index)
-                self.sku_listbox.see(new_selection_index)
-            except tk.TclError:
-                pass
 
     def add_sku(self):
+        """Adds the SKU from the entry field to the database and refreshes the list."""
         new_sku = self.sku_entry.get().strip()
         if not new_sku:
             messagebox.showwarning(
@@ -215,21 +257,21 @@ class SkuManagerWindow(Toplevel):
                 parent=self,
             )
 
-    def get_selected_sku(self):
+    def edit_selected_sku(self):
+        """Opens a dialog to edit the currently selected SKU. Best for single selection."""
         selected_indices = self.sku_listbox.curselection()
         if not selected_indices:
             messagebox.showwarning(
-                "Selection Error",
-                "Please select an SKU from the list first.",
-                parent=self,
+                "Selection Error", "Please select an SKU to edit.", parent=self
             )
             return None
-        return self.sku_listbox.get(selected_indices[0])
-
-    def edit_selected_sku(self):
-        selected_sku = self.get_selected_sku()
-        if selected_sku is None:
-            return
+        if len(selected_indices) > 1:
+            messagebox.showwarning(
+                "Multiple Selection",
+                "Multiple SKUs selected. Only the first one will be edited.",
+                parent=self,
+            )
+        selected_sku = self.sku_listbox.get(selected_indices[0])
         new_name = simpledialog.askstring(
             "Edit SKU",
             f"Enter the new name for SKU:",
@@ -257,25 +299,43 @@ class SkuManagerWindow(Toplevel):
                     parent=self,
                 )
 
-    def delete_selected_sku(self):
-        selected_sku = self.get_selected_sku()
-        if selected_sku is None:
+    def delete_selected_skus(self):
+        """Deletes all currently selected SKUs from the database."""
+        selected_indices = self.sku_listbox.curselection()
+        if not selected_indices:
+            messagebox.showwarning(
+                "Selection Error",
+                "Please select one or more SKUs to delete.",
+                parent=self,
+            )
             return
-        if messagebox.askyesno(
-            "Confirm Delete",
-            f"Are you sure you want to delete SKU:\n'{selected_sku}'?",
-            parent=self,
-        ):
-            if db.delete_sku(selected_sku):
-                self.refresh_sku_list()
-            else:
-                messagebox.showerror(
-                    "Database Error",
-                    f"Failed to delete SKU '{selected_sku}'. It might have already been deleted.",
-                    parent=self,
-                )
+        selected_skus = [self.sku_listbox.get(i) for i in selected_indices]
+        num_selected = len(selected_skus)
+        confirm_message = (
+            f"Are you sure you want to delete {num_selected} selected SKU(s)?"
+        )
+        if num_selected > 0 and num_selected <= 5:
+            confirm_message += "\n\n" + "\n".join(selected_skus)
+        elif num_selected > 5:
+            confirm_message += (
+                f"\n\n(e.g., {selected_skus[0]}, {selected_skus[1]}, ...)"
+            )
+        if messagebox.askyesno("Confirm Delete", confirm_message, parent=self):
+            deleted_count = 0
+            failed_count = 0
+            for sku in selected_skus:
+                if db.delete_sku(sku):
+                    deleted_count += 1
+                else:
+                    failed_count += 1
+            self.refresh_sku_list()
+            summary = f"Deleted: {deleted_count} SKU(s)."
+            if failed_count > 0:
+                summary += f"\nFailed: {failed_count} SKU(s)."
+                messagebox.showwarning("Deletion Report", summary, parent=self)
 
     def paste_skus_from_clipboard(self):
+        """Pastes SKUs from clipboard (one per line) into the database."""
         try:
             clipboard_content = self.clipboard_get()
         except tk.TclError:
@@ -298,7 +358,7 @@ class SkuManagerWindow(Toplevel):
         if not potential_skus:
             messagebox.showwarning(
                 "No SKUs Found",
-                "No valid SKU text found in clipboard data after processing.",
+                "No valid SKU text found in clipboard data.",
                 parent=self,
             )
             return
@@ -306,7 +366,7 @@ class SkuManagerWindow(Toplevel):
         failed_count = 0
         if not messagebox.askyesno(
             "Confirm Paste",
-            f"Found {len(potential_skus)} potential SKUs in clipboard.\n\nExample: '{potential_skus[0]}'\n\nProceed adding them? (Duplicates will be skipped)",
+            f"Found {len(potential_skus)} potential SKUs.\nProceed adding them? (Duplicates will be skipped)",
             parent=self,
         ):
             return
@@ -320,22 +380,19 @@ class SkuManagerWindow(Toplevel):
         messagebox.showinfo("Paste Complete", summary_message, parent=self)
 
 
-# --- Main Application Class (MODIFIED) ---
 class Application(tk.Tk):
     """Main application class."""
 
     def __init__(self):
         super().__init__()
         self.title("Product Name to SKU Converter")
-        self.geometry("700x620")
+        self.geometry("700x720")  # Adjusted height
 
-        # --- Determine Base Path (for script or frozen executable) ---
+        # --- Determine Base Path ---
         if getattr(sys, "frozen", False):
-            # Running as bundled executable (PyInstaller)
             self.base_path = os.path.dirname(sys.executable)
             print(f"Running bundled executable. Base path: {self.base_path}")
         else:
-            # Running as script
             self.base_path = os.path.dirname(os.path.abspath(__file__))
             print(f"Running as script. Base path: {self.base_path}")
 
@@ -343,44 +400,27 @@ class Application(tk.Tk):
         self.all_skus = []
         self._warned_no_skus = False
         self.similarity_threshold = IntVar(value=DEFAULT_THRESHOLD)
-        self.engine_choice = StringVar(value=ENGINE_FUZZY)  # Default to fuzzy
-        self.api_key_var = StringVar()  # To hold API key from entry
+        self.engine_choice = StringVar(value=ENGINE_FUZZY)
+        self.api_key_var = StringVar()  # Holds GUI entry text for API key
+        self.selected_gemini_model = StringVar(value=DEFAULT_GEMINI_MODEL)
 
-        # --- API Key Loading Logic ---
+        # --- Read potential API Key sources (ENV and File) ---
         self.env_api_key = os.environ.get(GEMINI_API_ENV_VAR)
         self.file_api_key = None
-        self.api_key_source = None  # To track where the key was loaded from
-
-        # 1. Check Environment Variable
+        key_file_path = os.path.join(self.base_path, API_KEY_FILENAME)
+        try:
+            with open(key_file_path, "r", encoding="utf-8") as f:  # Added encoding
+                key_from_file = f.readline().strip()
+                if key_from_file:
+                    self.file_api_key = key_from_file
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"Error reading API key file '{key_file_path}': {e}")
         if self.env_api_key:
-            print(
-                f"Info: Found Gemini API key in environment variable {GEMINI_API_ENV_VAR}."
-            )
-            self.api_key_source = "ENV"
-            self.api_key_var.set("Detected in Environment Variable")
-        else:
-            # 2. Check api_key.txt File
-            key_file_path = os.path.join(self.base_path, API_KEY_FILENAME)
-            try:
-                with open(key_file_path, "r") as f:
-                    self.file_api_key = f.readline().strip()
-                    if self.file_api_key:
-                        print(f"Info: Found Gemini API key in file: {key_file_path}")
-                        self.api_key_source = "FILE"
-                        self.api_key_var.set(f"Detected in {API_KEY_FILENAME}")
-                    else:
-                        print(
-                            f"Info: API key file '{key_file_path}' found but is empty."
-                        )
-                        self.api_key_source = None
-            except FileNotFoundError:
-                print(f"Info: API key file '{key_file_path}' not found.")
-                self.api_key_source = None  # Ensure it's None if file not found
-            except Exception as e:
-                print(f"Error reading API key file '{key_file_path}': {e}")
-                self.api_key_source = None
-
-        # 3. GUI Entry - Initial state set later in toggle_controls
+            print(f"Info: Found Gemini API key in ENV var.")
+        if self.file_api_key:
+            print(f"Info: Read API key from {API_KEY_FILENAME}.")
 
         # --- Widgets ---
         # Input Frame (Left)
@@ -390,7 +430,7 @@ class Application(tk.Tk):
             input_frame, height=15, width=40, wrap=tk.WORD
         )
 
-        # Button & Control Frame (Center)
+        # --- Control Frame (Center) ---
         control_frame = Frame(self)
         self.convert_button = Button(
             control_frame,
@@ -412,12 +452,15 @@ class Application(tk.Tk):
             value=ENGINE_FUZZY,
             command=self.toggle_controls,
         )
+        # Disable Gemini radio if library not found
+        gemini_radio_state = tk.NORMAL if GEMINI_AVAILABLE else tk.DISABLED
         self.gemini_radio = Radiobutton(
             engine_frame,
             text="Gemini AI",
             variable=self.engine_choice,
             value=ENGINE_GEMINI,
             command=self.toggle_controls,
+            state=gemini_radio_state,
         )
 
         # -- Fuzzy Threshold Controls --
@@ -436,16 +479,20 @@ class Application(tk.Tk):
             showvalue=0,
         )
 
-        # -- Gemini API Key Controls --
-        self.api_key_frame = Frame(control_frame)
-        api_key_label = Label(self.api_key_frame, text="Gemini API Key:")
+        # -- Gemini Controls Frame --
+        self.gemini_controls_frame = Frame(
+            control_frame
+        )  # Parent frame for Gemini controls
+
+        # API Key Sub-Frame
+        api_key_subframe = Frame(self.gemini_controls_frame)
+        api_key_label = Label(api_key_subframe, text="Gemini API Key:")
         self.api_key_entry = Entry(
-            self.api_key_frame, textvariable=self.api_key_var, width=20, show="*"
+            api_key_subframe, textvariable=self.api_key_var, width=20, show="*"
         )
-        # Updated info label text
         self.api_key_info_label = Label(
-            self.api_key_frame,
-            text=f"(Uses ENV > {API_KEY_FILENAME} > Entry)",
+            api_key_subframe,
+            text=f"(Priority: Entry > {API_KEY_FILENAME} > ENV)",
             fg="blue",
             cursor="hand2",
         )
@@ -453,14 +500,38 @@ class Application(tk.Tk):
             "<Button-1>",
             lambda e: messagebox.showinfo(
                 "API Key Info",
-                f"API Key Loading Order:\n"
-                f"1. Environment variable: {GEMINI_API_ENV_VAR}\n"
-                f"2. File in app folder: {API_KEY_FILENAME}\n"
-                f"3. Manual entry here (if 1 & 2 not found).\n\n"
-                f"Recommendation: Use Option 1 or 2 for better security.",
+                f"API Key Loading Priority:\n1. Manual entry here.\n2. File: {API_KEY_FILENAME}\n3. Env Var: {GEMINI_API_ENV_VAR}\n\nThe first non-empty key found is used.",
                 parent=self,
             ),
         )
+
+        # Model Selection Sub-Frame
+        model_select_subframe = Frame(self.gemini_controls_frame)
+        model_label = Label(model_select_subframe, text="Gemini Model:")
+        # Check if model list is empty before creating combobox
+        if not AVAILABLE_GEMINI_MODELS:
+            self.model_combobox = Label(
+                model_select_subframe, text="No models defined", fg="red"
+            )
+        else:
+            self.model_combobox = ttk.Combobox(
+                model_select_subframe,
+                textvariable=self.selected_gemini_model,
+                values=AVAILABLE_GEMINI_MODELS,
+                state="readonly",
+                width=18,
+            )
+            # Ensure default value is valid, otherwise set to first available
+            if DEFAULT_GEMINI_MODEL not in AVAILABLE_GEMINI_MODELS:
+                self.selected_gemini_model.set(AVAILABLE_GEMINI_MODELS[0])
+
+        # Prompt Instruction Sub-Frame
+        prompt_instr_subframe = Frame(self.gemini_controls_frame)
+        instr_label = Label(prompt_instr_subframe, text="Gemini Prompt Instructions:")
+        self.prompt_instr_text = scrolledtext.ScrolledText(
+            prompt_instr_subframe, height=6, width=30, wrap=tk.WORD
+        )
+        self.prompt_instr_text.insert("1.0", DEFAULT_GEMINI_INSTRUCTIONS)
 
         # Output Frame (Right)
         output_frame = Frame(self)
@@ -476,19 +547,33 @@ class Application(tk.Tk):
 
         # Layout for Control Frame (Center)
         control_frame.pack(side=tk.LEFT, padx=10, pady=10, fill=tk.Y)
-        self.convert_button.pack(pady=(20, 15))
+        self.convert_button.pack(pady=(10, 15))
         self.manage_button.pack(pady=15)
-        engine_frame.pack(pady=(20, 10), padx=5, fill=tk.X)
+        engine_frame.pack(pady=(15, 10), padx=5, fill=tk.X)
         self.fuzzy_radio.pack(anchor=tk.W)
         self.gemini_radio.pack(anchor=tk.W)
-        self.threshold_frame.pack(pady=10, padx=5, fill=tk.X)
+
+        # Pack Fuzzy frame (managed by toggle_controls)
+        self.threshold_frame.pack(pady=5, padx=5, fill=tk.X)
         threshold_label.pack(side=tk.LEFT)
         self.threshold_value_label.pack(side=tk.LEFT, padx=2)
         self.threshold_scale.pack(side=tk.LEFT, expand=True, fill=tk.X)
-        self.api_key_frame.pack(pady=10, padx=5, fill=tk.X)
+
+        # Pack Gemini frame (managed by toggle_controls)
+        self.gemini_controls_frame.pack(pady=5, padx=5, fill=tk.BOTH, expand=True)
+        # Layout Gemini sub-frames
+        api_key_subframe.pack(pady=(5, 0), fill=tk.X)  # Reduced top padding
         api_key_label.pack(anchor=tk.W)
         self.api_key_entry.pack(fill=tk.X, pady=(0, 2))
         self.api_key_info_label.pack(anchor=tk.W)
+
+        model_select_subframe.pack(pady=(5, 0), fill=tk.X)
+        model_label.pack(anchor=tk.W)
+        self.model_combobox.pack(fill=tk.X)
+
+        prompt_instr_subframe.pack(pady=5, fill=tk.BOTH, expand=True)
+        instr_label.pack(anchor=tk.W)
+        self.prompt_instr_text.pack(fill=tk.BOTH, expand=True)
 
         output_frame.pack(side=tk.LEFT, padx=10, pady=10, fill=tk.BOTH, expand=True)
         output_label.pack(anchor=tk.W, pady=(0, 5))
@@ -496,34 +581,37 @@ class Application(tk.Tk):
 
         # --- Initialization ---
         self.load_skus()
-        self.toggle_controls()  # Set initial UI state
+        # Set initial UI state based on default engine
+        self.toggle_controls()
 
-    # MODIFIED toggle_controls
     def toggle_controls(self):
-        """Show/hide controls based on selected engine and API key source."""
+        """Show/hide controls based on selected engine."""
         selected_engine = self.engine_choice.get()
         if selected_engine == ENGINE_FUZZY:
-            self.threshold_frame.pack(pady=10, padx=5, fill=tk.X)
-            self.api_key_frame.pack_forget()
-        elif selected_engine == ENGINE_GEMINI:
+            self.threshold_frame.pack(pady=5, padx=5, fill=tk.X)  # Show
+            self.gemini_controls_frame.pack_forget()  # Hide
+        elif selected_engine == ENGINE_GEMINI and GEMINI_AVAILABLE:
+            self.threshold_frame.pack_forget()  # Hide
+            self.gemini_controls_frame.pack(
+                pady=5, padx=5, fill=tk.BOTH, expand=True
+            )  # Show
+            # Always enable API key entry now due to priority change
+            self.api_key_entry.config(state=tk.NORMAL)
+            # Clear API key entry if it contains placeholder text from previous logic
+            if self.api_key_var.get().startswith("Detected in"):
+                self.api_key_var.set("")
+        else:  # Gemini selected but library missing, or other state
             self.threshold_frame.pack_forget()
-            self.api_key_frame.pack(pady=10, padx=5, fill=tk.X)
-            # Disable entry if key found in ENV or FILE, enable otherwise
-            if self.api_key_source in ["ENV", "FILE"]:
-                self.api_key_entry.config(state=tk.DISABLED)
-                # Make sure placeholder text reflects the source
-                if self.api_key_source == "ENV":
-                    self.api_key_var.set("Detected in Environment Variable")
-                else:  # Must be FILE
-                    self.api_key_var.set(f"Detected in {API_KEY_FILENAME}")
-            else:
-                # Enable entry, clear placeholder if necessary
-                self.api_key_entry.config(state=tk.NORMAL)
-                if self.api_key_var.get().startswith("Detected in"):
-                    self.api_key_var.set("")
-        else:  # Should not happen
-            self.threshold_frame.pack_forget()
-            self.api_key_frame.pack_forget()
+            self.gemini_controls_frame.pack_forget()
+            if selected_engine == ENGINE_GEMINI and not GEMINI_AVAILABLE:
+                messagebox.showerror(
+                    "Missing Library",
+                    "Gemini AI library not installed.\nPlease install 'google-generativeai'.",
+                    parent=self,
+                )
+                # Optionally switch back to fuzzy
+                # self.engine_choice.set(ENGINE_FUZZY)
+                # self.toggle_controls()
 
     def load_skus(self):
         """Loads/reloads the list of SKUs from the database into memory."""
@@ -532,26 +620,32 @@ class Application(tk.Tk):
         if not self.all_skus and not self._warned_no_skus:
             messagebox.showwarning(
                 "No SKUs Loaded",
-                "The SKU database is currently empty.\n\nPlease use 'Manage SKUs' to add your official SKU list before converting.",
+                "The SKU database is currently empty.\n\nPlease use 'Manage SKUs' to add your official SKU list.",
                 parent=self,
             )
             self._warned_no_skus = True
 
-    # MODIFIED perform_conversion
     def perform_conversion(self):
         """Reads input, finds matches using the selected engine, and displays results."""
         selected_engine = self.engine_choice.get()
         print(f"Starting conversion using engine: {selected_engine}")
 
+        # Check if Gemini library is needed but missing
+        if selected_engine == ENGINE_GEMINI and not GEMINI_AVAILABLE:
+            messagebox.showerror(
+                "Missing Library",
+                "Cannot use Gemini engine because the 'google-generativeai' library is not installed.",
+            )
+            return
+
         input_content = self.input_text.get("1.0", tk.END).strip()
         if not input_content:
             messagebox.showwarning(
                 "Input Error",
-                "Please paste product names into the input area on the left.",
+                "Please paste product names into the input area.",
                 parent=self,
             )
             return
-
         product_names = [
             name.strip() for name in input_content.splitlines() if name.strip()
         ]
@@ -560,13 +654,10 @@ class Application(tk.Tk):
                 "Input Error", "No valid product names found in the input.", parent=self
             )
             return
-
         self.load_skus()
         if not self.all_skus:
             messagebox.showerror(
-                "Error",
-                "No SKUs available in the database. Cannot perform conversion.",
-                parent=self,
+                "Error", "No SKUs available in the database.", parent=self
             )
             return
 
@@ -574,11 +665,12 @@ class Application(tk.Tk):
         self.output_text.config(state=tk.NORMAL)
         self.output_text.delete("1.0", tk.END)
         self.output_text.insert(
-            tk.END,
-            f"Processing {len(product_names)} items using {selected_engine}...\n(This may take a while with Gemini)",
+            tk.END, f"Processing {len(product_names)} items using {selected_engine}..."
         )
+        if selected_engine == ENGINE_GEMINI:
+            self.output_text.insert(tk.END, "\n(This may take a while...)")
         self.output_text.config(state=tk.DISABLED)
-        self.update_idletasks()
+        self.update_idletasks()  # Force GUI update to show message
 
         # --- Engine-Specific Logic ---
         if selected_engine == ENGINE_FUZZY:
@@ -590,62 +682,103 @@ class Application(tk.Tk):
             ]
 
         elif selected_engine == ENGINE_GEMINI:
-            # --- Determine API Key based on priority ---
+            # --- Determine API Key based on REVERSED priority ---
             api_key_to_use = None
-            if self.api_key_source == "ENV":
-                api_key_to_use = self.env_api_key
-                print("Using API key from Environment Variable.")
-            elif self.api_key_source == "FILE":
+            source = "Not Found"
+            gui_key = self.api_key_var.get().strip()
+            if gui_key:  # 1. Check GUI Entry
+                api_key_to_use = gui_key
+                source = "GUI Entry"
+            elif self.file_api_key:  # 2. Check File
                 api_key_to_use = self.file_api_key
-                print(f"Using API key from {API_KEY_FILENAME}.")
-            else:  # No key found in ENV or FILE, try GUI entry
-                gui_key = self.api_key_var.get().strip()
-                # Check if it's empty or still the placeholder text
-                if gui_key and not gui_key.startswith("Detected in"):
-                    api_key_to_use = gui_key
-                    print("Using API key from GUI entry.")
-                else:
-                    api_key_to_use = (
-                        None  # Explicitly set to None if entry is empty/placeholder
-                    )
+                source = f"{API_KEY_FILENAME}"
+            elif self.env_api_key:  # 3. Check ENV
+                api_key_to_use = self.env_api_key
+                source = "Environment Variable"
 
-            # Check if we have a key
+            # --- Get Selected Model and Instructions ---
+            selected_model = self.selected_gemini_model.get()
+            custom_instructions = self.prompt_instr_text.get("1.0", tk.END).strip()
+
+            # --- Validate Inputs ---
             if not api_key_to_use:
                 messagebox.showerror(
                     "API Key Error",
-                    f"Gemini API Key not found.\nPlease set the {GEMINI_API_ENV_VAR} environment variable, create {API_KEY_FILENAME} in the app folder, or paste the key into the field.",
+                    f"Gemini API Key not found.\nPlease enter key in the GUI, create {API_KEY_FILENAME}, or set the {GEMINI_API_ENV_VAR} environment variable.",
+                    parent=self,
+                )
+                self.output_text.config(state=tk.NORMAL)
+                self.output_text.delete("1.0", tk.END)
+                self.output_text.insert(tk.END, "Cancelled: Missing API Key.")
+                self.output_text.config(state=tk.DISABLED)
+                return
+            if not selected_model:
+                messagebox.showerror(
+                    "Model Error", "No Gemini model selected.", parent=self
+                )
+                self.output_text.config(state=tk.NORMAL)
+                self.output_text.delete("1.0", tk.END)
+                self.output_text.insert(tk.END, "Cancelled: No Model Selected.")
+                self.output_text.config(state=tk.DISABLED)
+                return
+            if not custom_instructions:
+                messagebox.showerror(
+                    "Instructions Error",
+                    "Gemini prompt instructions cannot be empty.",
                     parent=self,
                 )
                 self.output_text.config(state=tk.NORMAL)
                 self.output_text.delete("1.0", tk.END)
                 self.output_text.insert(
-                    tk.END, "Conversion cancelled: Missing API Key."
+                    tk.END, "Cancelled: Missing Prompt Instructions."
                 )
                 self.output_text.config(state=tk.DISABLED)
-                return  # Stop processing
+                return
 
-            print("Using Gemini AI. API calls can take time...")
-            # Process sequentially
+            # --- Process Items ---
+            print(f"Using API key from: {source}. Model: {selected_model}.")
             for i, name in enumerate(product_names):
+                # Optionally update status bar or title here...
+                # self.title(f"Processing {i+1}/{len(product_names)}...")
                 match_result = find_best_sku_match_gemini(
-                    name, self.all_skus, api_key_to_use
+                    name,
+                    self.all_skus,
+                    api_key_to_use,
+                    selected_model,
+                    custom_instructions,
                 )
                 matched_skus.append(match_result)
-                if "ERROR: INVALID API KEY" in match_result:
-                    messagebox.showerror(
-                        "API Key Error",
-                        "Gemini API Key seems invalid. Please check the key source (ENV, file, or entry) and try again.",
-                        parent=self,
-                    )
-                    break  # Stop processing
-                elif (
-                    "ERROR: MISSING API KEY" in match_result
-                ):  # Should be caught earlier, but just in case
-                    messagebox.showerror(
-                        "API Key Error", "Gemini API Key missing.", parent=self
-                    )
-                    break
-
+                # Handle critical errors during loop
+                if (
+                    "ERROR:" in match_result and "ERROR DURING" not in match_result
+                ):  # Check for critical errors like invalid key/model
+                    if "INVALID API KEY" in match_result:
+                        messagebox.showerror(
+                            "API Key Error",
+                            f"Gemini API Key seems invalid (from {source}). Please check the key.",
+                            parent=self,
+                        )
+                    elif (
+                        "MODEL" in match_result
+                        and "NOT FOUND/ACCESSIBLE" in match_result
+                    ):
+                        messagebox.showerror(
+                            "Model Error",
+                            f"Selected Gemini model '{selected_model}' not found or access denied.",
+                            parent=self,
+                        )
+                    elif "MISSING API KEY" in match_result:  # Should be caught earlier
+                        messagebox.showerror(
+                            "API Key Error", "Gemini API Key missing.", parent=self
+                        )
+                    else:  # Generic API error
+                        messagebox.showerror(
+                            "Gemini API Error",
+                            f"An error occurred during the API call:\n{match_result}",
+                            parent=self,
+                        )
+                    break  # Stop processing other items on critical error
+            # self.title("Product Name to SKU Converter") # Reset title
             print("Gemini processing finished.")
 
         # --- Display final results ---
@@ -663,10 +796,14 @@ class Application(tk.Tk):
         """Opens the SKU Management window."""
         manager_window = SkuManagerWindow(self)
         self.wait_window(manager_window)
-        self.load_skus()
+        self.load_skus()  # Reload SKUs after manager closes
 
 
 # --- Run the Application ---
 if __name__ == "__main__":
+    # Ensure database exists (handled by database.py import)
+    # db.init_db() # Called automatically on import now
+
+    # Create and run the main application window
     app = Application()
     app.mainloop()
